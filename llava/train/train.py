@@ -464,7 +464,7 @@ def train():
     if model_args.vision_tower is not None:
         model = LlavaLlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
+            cache_dir=training_args.cache_dir
         )
     else:
         model = transformers.LlamaForCausalLM.from_pretrained(

@@ -23,3 +23,10 @@ output
 
 checkpoints
 ckpts*
+
+*events*
+*.bin
+*.err
+*.out 
+*.slurm
+*.sh
