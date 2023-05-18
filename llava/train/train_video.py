@@ -102,6 +102,45 @@ class TrainingArguments(transformers.TrainingArguments):
 
 logger = logging_sf.get_logger(__name__)
 
+def distribute_model(cfg, model, gpu_id=None):
+    """
+    Builds the video model.
+    Args:
+        cfg (configs): configs that contains the hyper-parameters to build the
+        backbone. Details can be seen in slowfast/config/defaults.py.
+        gpu_id (Optional[int]): specify the gpu index to build model.
+    """
+    if torch.cuda.is_available():
+        assert (
+            cfg.NUM_GPUS <= torch.cuda.device_count()
+        ), "Cannot use more GPU devices than available"
+    else:
+        assert (
+            cfg.NUM_GPUS == 0
+        ), "Cuda is not available. Please set `NUM_GPUS: 0 for running on CPUs."
+
+    if cfg.NUM_GPUS:
+        if gpu_id is None:
+            # Determine the GPU used by the current process
+            cur_device = torch.cuda.current_device()
+        else:
+            cur_device = gpu_id
+        # Transfer the model to the current GPU device
+        model = model.cuda(device=cur_device)
+    # Use multi-process data parallel model in the multi-gpu setting
+    if cfg.NUM_GPUS > 1:
+        # Make model replica operate on the current device
+        model = torch.nn.parallel.DistributedDataParallel(
+            module=model,
+            device_ids=[cur_device],
+            output_device=cur_device,
+            find_unused_parameters=True
+            if cfg.MODEL.DETACH_FINAL_FC
+            or cfg.MODEL.MODEL_NAME == "ContrastiveModel"
+            else False,
+        )
+    return model
+
 def construct_loader(cfg, split, dataset, collate_fn, is_precise_bn=False):
     """
     Constructs the data loader for the given dataset.
@@ -221,8 +260,10 @@ def perform_test(test_loader, model, test_meter, cfg, writer=None):
         test_loader
     ):
         input_ids = batch["input_ids"]
+        labels = batch["labels"]
+        attention_mask = batch["attention_mask"]
         inputs = batch["videos"]
-        labels = batch["ssv2_label"]
+        ssv2_labels = batch["ssv2_label"]
         video_idx = batch["ssv2_video_idx"]
         time = batch["ssv2_time"]
         meta = {}
@@ -235,7 +276,9 @@ def perform_test(test_loader, model, test_meter, cfg, writer=None):
             else:
                 inputs = inputs.cuda(non_blocking=True)
             # Transfer the data to the current GPU device.
+            ssv2_labels = ssv2_labels.cuda()
             labels = labels.cuda()
+            attention_mask = attention_mask.cuda()
             input_ids = input_ids.cuda(non_blocking=True)
             video_idx = video_idx.cuda()
             for key, val in meta.items():
@@ -295,48 +338,48 @@ def perform_test(test_loader, model, test_meter, cfg, writer=None):
             preds = torch.sum(probs, 1)
         else:
             # Perform the forward pass.
-            preds = model(input_ids = input_ids, videos = inputs)
+            model(input_ids = input_ids, labels = labels, videos = inputs, attention_mask=attention_mask, mode="test")
         # Gather all the predictions across all the devices to perform ensemble.
-        if cfg.NUM_GPUS > 1:
-            preds, labels, video_idx = du.all_gather([preds[1], labels, video_idx])
-        if cfg.NUM_GPUS:
-            preds = preds[1].cpu()
-            labels = labels.cpu()
-            video_idx = video_idx.cpu()
+    #     if cfg.NUM_GPUS > 1:
+    #         preds, labels, video_idx = du.all_gather([preds[1], labels, video_idx])
+    #     if cfg.NUM_GPUS:
+    #         preds = preds[1].cpu()
+    #         labels = labels.cpu()
+    #         video_idx = video_idx.cpu()
 
         test_meter.iter_toc()
-        if not cfg.VIS_MASK.ENABLE:
-            # Update and log stats.
-            test_meter.update_stats(
-                preds.detach(), labels.detach(), video_idx.detach()
-            )
-        test_meter.log_iter_stats(cur_iter)
+    #     if not cfg.VIS_MASK.ENABLE:
+    #         # Update and log stats.
+    #         test_meter.update_stats(
+    #             preds.detach(), labels.detach(), video_idx.detach()
+    #         )
+    #     test_meter.log_iter_stats(cur_iter)
 
         test_meter.iter_tic()
 
-    # Log epoch stats and print the final testing results.
-    if not cfg.DETECTION.ENABLE:
-        all_preds = test_meter.video_preds.clone().detach()
-        all_labels = test_meter.video_labels
-        if cfg.NUM_GPUS:
-            all_preds = all_preds.cpu()
-            all_labels = all_labels.cpu()
-        if writer is not None:
-            writer.plot_eval(preds=all_preds, labels=all_labels)
+    # # Log epoch stats and print the final testing results.
+    # if not cfg.DETECTION.ENABLE:
+    #     all_preds = test_meter.video_preds.clone().detach()
+    #     all_labels = test_meter.video_labels
+    #     if cfg.NUM_GPUS:
+    #         all_preds = all_preds.cpu()
+    #         all_labels = all_labels.cpu()
+    #     if writer is not None:
+    #         writer.plot_eval(preds=all_preds, labels=all_labels)
 
-        if cfg.TEST.SAVE_RESULTS_PATH != "":
-            save_path = os.path.join(cfg.OUTPUT_DIR, cfg.TEST.SAVE_RESULTS_PATH)
+    #     if cfg.TEST.SAVE_RESULTS_PATH != "":
+    #         save_path = os.path.join(cfg.OUTPUT_DIR, cfg.TEST.SAVE_RESULTS_PATH)
 
-            if du.is_root_proc():
-                with pathmgr.open(save_path, "wb") as f:
-                    pickle.dump([all_preds, all_labels], f)
+    #         if du.is_root_proc():
+    #             with pathmgr.open(save_path, "wb") as f:
+    #                 pickle.dump([all_preds, all_labels], f)
 
-            logger.info(
-                "Successfully saved prediction results to {}".format(save_path)
-            )
+    #         logger.info(
+    #             "Successfully saved prediction results to {}".format(save_path)
+    #         )
 
-    test_meter.finalize_metrics()
-    return test_meter
+    # test_meter.finalize_metrics()
+    # return test_meter
 
 
 def test(cfg, model, tokenizer, data_module):
@@ -416,39 +459,40 @@ def test(cfg, model, tokenizer, data_module):
             writer = None
 
         # # Perform multi-view test on the entire dataset.
-        test_meter = perform_test(test_loader, model, test_meter, cfg, writer)
-        test_meters.append(test_meter)
-        if writer is not None:
-            writer.close()
+        #test_meter = perform_test(test_loader, model, test_meter, cfg, writer)
+        perform_test(test_loader, model, test_meter, cfg, writer)
+    #     test_meters.append(test_meter)
+    #     if writer is not None:
+    #         writer.close()
 
-    result_string_views = "_p{:.2f}_f{:.2f}".format(params / 1e6, flops)
+    # result_string_views = "_p{:.2f}_f{:.2f}".format(params / 1e6, flops)
 
-    for view, test_meter in zip(cfg.TEST.NUM_TEMPORAL_CLIPS, test_meters):
-        logger.info(
-            "Finalized testing with {} temporal clips and {} spatial crops".format(
-                view, cfg.TEST.NUM_SPATIAL_CROPS
-            )
-        )
-        result_string_views += "_{}a{}" "".format(
-            view, test_meter.stats["top1_acc"]
-        )
+    # for view, test_meter in zip(cfg.TEST.NUM_TEMPORAL_CLIPS, test_meters):
+    #     logger.info(
+    #         "Finalized testing with {} temporal clips and {} spatial crops".format(
+    #             view, cfg.TEST.NUM_SPATIAL_CROPS
+    #         )
+    #     )
+    #     result_string_views += "_{}a{}" "".format(
+    #         view, test_meter.stats["top1_acc"]
+    #     )
 
-        result_string = (
-            "_p{:.2f}_f{:.2f}_{}a{} Top5 Acc: {} MEM: {:.2f} f: {:.4f}"
-            "".format(
-                params / 1e6,
-                flops,
-                view,
-                test_meter.stats["top1_acc"],
-                test_meter.stats["top5_acc"],
-                misc.gpu_mem_usage(),
-                flops,
-            )
-        )
+    #     result_string = (
+    #         "_p{:.2f}_f{:.2f}_{}a{} Top5 Acc: {} MEM: {:.2f} f: {:.4f}"
+    #         "".format(
+    #             params / 1e6,
+    #             flops,
+    #             view,
+    #             test_meter.stats["top1_acc"],
+    #             test_meter.stats["top5_acc"],
+    #             misc.gpu_mem_usage(),
+    #             flops,
+    #         )
+    #     )
 
-        logger.info("{}".format(result_string))
-    logger.info("{}".format(result_string_views))
-    return result_string + " \n " + result_string_views
+    #     logger.info("{}".format(result_string))
+    # logger.info("{}".format(result_string_views))
+    # return result_string + " \n " + result_string_views
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
@@ -704,7 +748,7 @@ class LazySupervisedDataset(Dataset):
                  multimodal_cfg: dict):
         super(LazySupervisedDataset, self).__init__()
         logging.warning("Loading data...")
-        data_path = os.path.join(data_path,f"ssv2_{mode}.json")
+        data_path = os.path.join(data_path,f"ssv2_{mode}_v1.json")
         list_data_dict = json.load(open(data_path, "r"))
 
         logging.warning("Formatting inputs...Skip in lazy mode")
@@ -776,20 +820,23 @@ class DataCollatorForSupervisedDataset(object):
 
 
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
-                                data_args, vision_config, eval = True) -> Dict:
+                                data_args, vision_config, train = False, eval = False) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
     dataset_cls = (LazySupervisedDatasetSSv2
                    if data_args.lazy_preprocess else SupervisedDataset)
-    train_dataset = dataset_cls(tokenizer=tokenizer,
-                                data_path=data_args.data_path,
-                                multimodal_cfg=dict(
-                                    is_multimodal=data_args.is_multimodal,
-                                    image_token_len=data_args.image_token_len,
-                                    image_folder=data_args.image_folder,
-                                    image_aspect_ratio=data_args.image_aspect_ratio,
-                                    use_im_start_end=getattr(data_args, 'mm_use_im_start_end', False),
-                                    image_processor=getattr(data_args, 'image_processor', None)), cfg = vision_config, mode = "train")
-    if eval == True:
+    train_dataset = None
+    eval_dataset = None
+    if train:
+        train_dataset = dataset_cls(tokenizer=tokenizer,
+                                    data_path=data_args.data_path,
+                                    multimodal_cfg=dict(
+                                        is_multimodal=data_args.is_multimodal,
+                                        image_token_len=data_args.image_token_len,
+                                        image_folder=data_args.image_folder,
+                                        image_aspect_ratio=data_args.image_aspect_ratio,
+                                        use_im_start_end=getattr(data_args, 'mm_use_im_start_end', False),
+                                        image_processor=getattr(data_args, 'image_processor', None)), cfg = vision_config, mode = "train")
+    if eval:
         eval_dataset = dataset_cls(tokenizer=tokenizer,
                                     data_path=data_args.data_path,
                                     multimodal_cfg=dict(
@@ -857,7 +904,10 @@ def train(mvit_cfg):
         dtype = torch.float16
     if training_args.bf16:
         dtype = torch.bfloat16
-    model.model.vision_tower[0].to(dtype=dtype, device=training_args.device)
+    if training_args.do_train:
+        model.model.vision_tower[0].to(dtype=dtype, device=training_args.device)
+    else:
+        model.model.vision_tower[0].to(dtype=dtype)
     vision_config = model_vision_dict['vision_config']
 
     data_args.image_token_len = model_vision_dict['image_token_len']
@@ -900,20 +950,26 @@ def train(mvit_cfg):
             FSDP.__init__ = patch_FSDP_use_orig_params(FSDP.__init__)
 
     data_module = make_supervised_data_module(tokenizer=tokenizer,
-                                              data_args=data_args, vision_config = mvit_cfg)
-    trainer = LLaVATrainer(model=model,
-                     tokenizer=tokenizer,
-                     args=training_args,
-                     **data_module)
+                                              data_args=data_args, vision_config = mvit_cfg, train = training_args.do_train, eval=training_args.do_eval)
+    if training_args.do_train:
+        trainer = LLaVATrainer(model=model,
+                        tokenizer=tokenizer,
+                        args=training_args,
+                        **data_module)
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-         trainer.train(resume_from_checkpoint=True)
-    else:
-         trainer.train()
-    trainer.save_state()
-    safe_save_model_for_hf_trainer(trainer=trainer,
-                                    output_dir=training_args.output_dir)
-    #test(mvit_cfg, model, tokenizer, data_module)
+        if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+            trainer.train(resume_from_checkpoint=True)
+        else:
+            trainer.train()
+        trainer.save_state()
+        safe_save_model_for_hf_trainer(trainer=trainer,
+                                        output_dir=training_args.output_dir)
+    if training_args.do_eval:
+        if not training_args.do_train:
+                # Set up environment.
+            du.init_distributed_training(mvit_cfg)
+            distribute_model(mvit_cfg, model)
+        test(mvit_cfg, model, tokenizer, data_module)
 
 
 

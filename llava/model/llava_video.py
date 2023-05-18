@@ -31,6 +31,8 @@ import slowfast.slowfast.utils.checkpoint as cu
 
 from argparse import Namespace
 
+import re
+
 
 DEFAULT_VIDEO_TOKEN = "<video>"
 DEFAULT_VIDEO_PATCH_TOKEN = "<vid_patch>"
@@ -261,10 +263,13 @@ class LlavaVideoLlamaForCausalLM(LlamaForCausalLM):
                 # Enable model/pipeline parallelism
                 shift_labels = shift_labels.to(shift_logits.device)
                 loss = loss_fct(shift_logits, shift_labels)
-                if loss.item() < 0.8:
-                    with open("output.txt", "a") as file:
-                        for a,b in zip(gt_answers,answers):
-                            b.replace("\n","")
+                with open("output_train.txt", "a") as file:
+                    for a,b in zip(gt_answers,answers):
+                        a_assistant = re.search("Assistant",a)
+                        b_assistant = re.search("Assistant",b)
+                        if b_assistant and a_assistant:
+                            a = a[a_assistant.regs[0][0]:]
+                            b = b[b_assistant.regs[0][0]:]
                             line = f"real answer: {a} \n predicted answer: {b} \n"
                             file.write(line)
 
@@ -280,7 +285,31 @@ class LlavaVideoLlamaForCausalLM(LlamaForCausalLM):
                 attentions=outputs.attentions,
             )
         else:
-            return
+            logits = self.lm_head(hidden_states)
+            if labels is not None:
+                # Shift so that tokens < n predict n
+                shift_logits = logits[..., :-1, :].contiguous()
+                pred_tokens = torch.argmax(shift_logits,dim=2)
+                shift_labels = labels[..., 1:].contiguous()
+                gt_tokens = shift_labels
+                gt_labels = []
+                for j in range(gt_tokens.shape[0]):
+                    gt_label = gt_tokens[j]
+                    gt_label = gt_label.tolist()
+                    gt_label = torch.tensor([idx for idx in gt_label if idx > 0 ])
+                    gt_labels.append(gt_label)
+                # Flatten the tokens
+                answers = self.tokenizer.batch_decode(pred_tokens, skip_special_tokens=True)
+                gt_answers = self.tokenizer.batch_decode(gt_labels, skip_special_tokens=True)
+                with open("output_test.txt", "a") as file:
+                    for a,b in zip(gt_answers,answers):
+                        a_assistant = re.search("Assistant",a)
+                        b_assistant = re.search("Assistant",b)
+                        if b_assistant and a_assistant:
+                            a = a[a_assistant.regs[0][0]:]
+                            b = b[b_assistant.regs[0][0]:]
+                        line = f"real answer: {a} \n predicted answer: {b} \n"
+                        file.write(line)
 
     def prepare_inputs_for_generation(
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
