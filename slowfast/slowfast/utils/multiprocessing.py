@@ -15,6 +15,9 @@ def run(
     num_shards,
     backend,
     cfg,
+    model,
+    tokenizer,
+    data_module,
     output_queue=None,
 ):
     """
@@ -57,6 +60,6 @@ def run(
         raise e
 
     torch.cuda.set_device(local_rank)
-    ret = func(cfg)
+    ret = func(cfg, model, tokenizer, data_module)
     if output_queue is not None and local_rank == 0:
         output_queue.put(ret)

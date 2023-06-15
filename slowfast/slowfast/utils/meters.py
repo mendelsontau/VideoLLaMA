@@ -323,6 +323,7 @@ class TestMeter(object):
             clip_ids (tensor): clip indexes of the current batch, dimension is
                 N.
         """
+        print(preds.shape[0])
         for ind in range(preds.shape[0]):
             vid_id = int(clip_ids[ind]) // self.num_clips
             if self.video_labels[vid_id].sum() > 0:

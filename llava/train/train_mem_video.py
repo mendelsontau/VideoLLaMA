@@ -25,9 +25,12 @@ if __name__ == "__main__":
         num_shards = 1,
         init_method = "tcp://localhost:9999",
         cfg = ["slowfast/configs/SSv2/MVITv2_S_16x4.yaml"],
-        opts = None
+        opts = None,
+        dist_url = "env://",
+        dist_backend = "nccl",
+        no_set_device_rank = False
     )
     path_to_mvit_config = "slowfast/configs/SSv2/MVITv2_S_16x4.yaml"
     mvit_cfg = load_config(mvit_args,mvit_args.cfg[0])
     mvit_cfg = assert_and_infer_cfg(mvit_cfg)
-    train(mvit_cfg)
+    train(mvit_cfg, mvit_args)

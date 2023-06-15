@@ -118,6 +118,7 @@ class Ssv2(torch.utils.data.Dataset):
             "r"
         ) as f:
             label_dict = json.load(f)
+        self.label_dict = label_dict
 
         # Loading labels.
         with pathmgr.open(label_file, "r") as f:

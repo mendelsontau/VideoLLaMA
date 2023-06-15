@@ -41,11 +41,16 @@ import slowfast.slowfast.utils.misc as misc
 import slowfast.slowfast.visualization.tensorboard_vis as tb
 from slowfast.slowfast.utils.env import pathmgr
 from slowfast.slowfast.utils.meters import AVAMeter, TestMeter
+import slowfast.slowfast.utils.multiprocessing as mpu
 
 from slowfast.slowfast.datasets import utils as utils
 
 from PIL import Image
 import torch.nn as nn
+from Levenshtein import distance
+
+from llava.train.distributed import is_master, init_distributed_device, world_info_from_env
+import torch.distributed as dist
 
 # TODO: import and use code from ../data/dataset.py
 
@@ -110,6 +115,7 @@ def distribute_model(cfg, model, gpu_id=None):
         backbone. Details can be seen in slowfast/config/defaults.py.
         gpu_id (Optional[int]): specify the gpu index to build model.
     """
+    print(torch.cuda.mem_get_info())
     if torch.cuda.is_available():
         assert (
             cfg.NUM_GPUS <= torch.cuda.device_count()
@@ -127,7 +133,9 @@ def distribute_model(cfg, model, gpu_id=None):
             cur_device = gpu_id
         # Transfer the model to the current GPU device
         model = model.cuda(device=cur_device)
-    # Use multi-process data parallel model in the multi-gpu setting
+        model.model.vision_tower[0] = model.model.vision_tower[0].cuda(device=cur_device)
+    print(torch.cuda.mem_get_info())
+    #Use multi-process data parallel model in the multi-gpu setting
     if cfg.NUM_GPUS > 1:
         # Make model replica operate on the current device
         model = torch.nn.parallel.DistributedDataParallel(
@@ -232,7 +240,7 @@ def construct_loader(cfg, split, dataset, collate_fn, is_precise_bn=False):
 
 
 @torch.no_grad()
-def perform_test(test_loader, model, test_meter, cfg, writer=None):
+def perform_test(test_loader, dataset_labels_dict, model, test_meter, cfg, mvit_args, writer=None):
     """
     For classification:
     Perform mutli-view testing that uniformly samples N clips from a video along
@@ -256,6 +264,7 @@ def perform_test(test_loader, model, test_meter, cfg, writer=None):
     model.eval()
     test_meter.iter_tic()
 
+    
     for cur_iter, batch in enumerate(
         test_loader
     ):
@@ -338,51 +347,62 @@ def perform_test(test_loader, model, test_meter, cfg, writer=None):
             preds = torch.sum(probs, 1)
         else:
             # Perform the forward pass.
-            model(input_ids = input_ids, labels = labels, videos = inputs, attention_mask=attention_mask, mode="test")
-        # Gather all the predictions across all the devices to perform ensemble.
-    #     if cfg.NUM_GPUS > 1:
-    #         preds, labels, video_idx = du.all_gather([preds[1], labels, video_idx])
-    #     if cfg.NUM_GPUS:
-    #         preds = preds[1].cpu()
-    #         labels = labels.cpu()
-    #         video_idx = video_idx.cpu()
+            preds = []
+            returned_answers = model(input_ids = input_ids, labels = labels, videos = inputs, attention_mask=attention_mask, mode="test")
+            for ans in returned_answers:
+                l_distances = torch.tensor([-1 * distance(ans,template) for template in dataset_labels_dict]).to(device=ssv2_labels.device)
+                l_distances = torch.exp(l_distances)
+                preds.append(l_distances)
+            preds = torch.stack(preds)
+         #Gather all the predictions across all the devices to perform ensemble.
+        if cfg.NUM_GPUS > 1:
+            preds, labels, video_idx = du.all_gather([preds, labels, video_idx])
+        if cfg.NUM_GPUS:
+            preds = preds.cpu()
+            ssv2_labels = ssv2_labels.cpu()
+            video_idx = video_idx.cpu()
+        
+        if is_master(mvit_args):
+        
+            print(preds.shape[0])
 
-        test_meter.iter_toc()
-    #     if not cfg.VIS_MASK.ENABLE:
-    #         # Update and log stats.
-    #         test_meter.update_stats(
-    #             preds.detach(), labels.detach(), video_idx.detach()
-    #         )
-    #     test_meter.log_iter_stats(cur_iter)
+            test_meter.iter_toc()
+            if not cfg.VIS_MASK.ENABLE:
+                # Update and log stats.
+                test_meter.update_stats(
+                    preds.detach(), ssv2_labels.detach(), video_idx.detach()
+                )
+            test_meter.log_iter_stats(cur_iter)
 
-        test_meter.iter_tic()
+            test_meter.iter_tic()
+        dist.barrier()
 
-    # # Log epoch stats and print the final testing results.
-    # if not cfg.DETECTION.ENABLE:
-    #     all_preds = test_meter.video_preds.clone().detach()
-    #     all_labels = test_meter.video_labels
-    #     if cfg.NUM_GPUS:
-    #         all_preds = all_preds.cpu()
-    #         all_labels = all_labels.cpu()
-    #     if writer is not None:
-    #         writer.plot_eval(preds=all_preds, labels=all_labels)
+    # Log epoch stats and print the final testing results.
+    if not cfg.DETECTION.ENABLE:
+        all_preds = test_meter.video_preds.clone().detach()
+        all_labels = test_meter.video_labels
+        if cfg.NUM_GPUS:
+            all_preds = all_preds.cpu()
+            all_labels = all_labels.cpu()
+        if writer is not None:
+            writer.plot_eval(preds=all_preds, labels=all_labels)
 
-    #     if cfg.TEST.SAVE_RESULTS_PATH != "":
-    #         save_path = os.path.join(cfg.OUTPUT_DIR, cfg.TEST.SAVE_RESULTS_PATH)
+        if cfg.TEST.SAVE_RESULTS_PATH != "":
+            save_path = os.path.join(cfg.OUTPUT_DIR, cfg.TEST.SAVE_RESULTS_PATH)
 
-    #         if du.is_root_proc():
-    #             with pathmgr.open(save_path, "wb") as f:
-    #                 pickle.dump([all_preds, all_labels], f)
+            if du.is_root_proc():
+                with pathmgr.open(save_path, "wb") as f:
+                    pickle.dump([all_preds, all_labels], f)
 
-    #         logger.info(
-    #             "Successfully saved prediction results to {}".format(save_path)
-    #         )
+            logger.info(
+                "Successfully saved prediction results to {}".format(save_path)
+            )
 
-    # test_meter.finalize_metrics()
-    # return test_meter
+    test_meter.finalize_metrics()
+    return test_meter
 
 
-def test(cfg, model, tokenizer, data_module):
+def test(cfg, model, tokenizer, data_module, mvit_args):
     """
     Perform multi-view testing on the pretrained video model.
     Args:
@@ -392,6 +412,8 @@ def test(cfg, model, tokenizer, data_module):
     # Set up environment.
     #du.init_distributed_training(cfg)
     # Set random seed from configs.
+    #du.init_distributed_training(cfg)
+    #distribute_model(cfg, model)
     np.random.seed(cfg.RNG_SEED)
     torch.manual_seed(cfg.RNG_SEED)
 
@@ -426,6 +448,8 @@ def test(cfg, model, tokenizer, data_module):
 
         # Create video testing loaders.
         test_loader = construct_loader(cfg, "test",data_module["eval_dataset"],data_module["data_collator"])
+        dataset_labels_dict = data_module["eval_dataset"].dataset_ssv2.label_dict
+        dataset_labels_list = [k for k in dataset_labels_dict]
         logger.info("Testing model for {} iterations".format(len(test_loader)))
 
         if cfg.DETECTION.ENABLE:
@@ -458,41 +482,41 @@ def test(cfg, model, tokenizer, data_module):
         else:
             writer = None
 
-        # # Perform multi-view test on the entire dataset.
-        #test_meter = perform_test(test_loader, model, test_meter, cfg, writer)
-        perform_test(test_loader, model, test_meter, cfg, writer)
-    #     test_meters.append(test_meter)
-    #     if writer is not None:
-    #         writer.close()
+        # Perform multi-view test on the entire dataset.
+        test_meter = perform_test(test_loader, dataset_labels_list, model, test_meter, cfg, mvit_args, writer)
+        #perform_test(test_loader, dataset_labels_list, model, test_meter, cfg, writer)
+        test_meters.append(test_meter)
+        if writer is not None:
+            writer.close()
 
-    # result_string_views = "_p{:.2f}_f{:.2f}".format(params / 1e6, flops)
+    result_string_views = "_p{:.2f}_f{:.2f}".format(13000000000 / 1e6, 10)
 
-    # for view, test_meter in zip(cfg.TEST.NUM_TEMPORAL_CLIPS, test_meters):
-    #     logger.info(
-    #         "Finalized testing with {} temporal clips and {} spatial crops".format(
-    #             view, cfg.TEST.NUM_SPATIAL_CROPS
-    #         )
-    #     )
-    #     result_string_views += "_{}a{}" "".format(
-    #         view, test_meter.stats["top1_acc"]
-    #     )
+    for view, test_meter in zip(cfg.TEST.NUM_TEMPORAL_CLIPS, test_meters):
+        logger.info(
+            "Finalized testing with {} temporal clips and {} spatial crops".format(
+                view, cfg.TEST.NUM_SPATIAL_CROPS
+            )
+        )
+        result_string_views += "_{}a{}" "".format(
+            view, test_meter.stats["top1_acc"]
+        )
 
-    #     result_string = (
-    #         "_p{:.2f}_f{:.2f}_{}a{} Top5 Acc: {} MEM: {:.2f} f: {:.4f}"
-    #         "".format(
-    #             params / 1e6,
-    #             flops,
-    #             view,
-    #             test_meter.stats["top1_acc"],
-    #             test_meter.stats["top5_acc"],
-    #             misc.gpu_mem_usage(),
-    #             flops,
-    #         )
-    #     )
+        result_string = (
+            "_p{:.2f}_f{:.2f}_{}a{} Top5 Acc: {} MEM: {:.2f} f: {:.4f}"
+            "".format(
+                13000000000 / 1e6,
+                10,
+                view,
+                test_meter.stats["top1_acc"],
+                test_meter.stats["top5_acc"],
+                misc.gpu_mem_usage(),
+                10,
+            )
+        )
 
-    #     logger.info("{}".format(result_string))
-    # logger.info("{}".format(result_string_views))
-    # return result_string + " \n " + result_string_views
+        logger.info("{}".format(result_string))
+    logger.info("{}".format(result_string_views))
+    return result_string + " \n " + result_string_views
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
@@ -853,7 +877,7 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                 data_collator=data_collator)
 
 
-def train(mvit_cfg):
+def train(mvit_cfg, mvit_args):
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
@@ -931,6 +955,7 @@ def train(mvit_cfg):
                                         tune_mm_mlp_adapter=model_args.tune_mm_mlp_adapter, pretrain_mm_mlp_adapter=model_args.pretrain_mm_mlp_adapter)
 
     params_no_grad = [n for n, p in model.named_parameters() if not p.requires_grad]
+    print(len([n for n, p in model.named_parameters() if p.requires_grad]))
     if len(params_no_grad) > 0:
         if training_args.fsdp is not None and len(training_args.fsdp) > 0:
             if len(params_no_grad) < 10:
@@ -966,10 +991,15 @@ def train(mvit_cfg):
                                         output_dir=training_args.output_dir)
     if training_args.do_eval:
         if not training_args.do_train:
-                # Set up environment.
-            du.init_distributed_training(mvit_cfg)
-            distribute_model(mvit_cfg, model)
-        test(mvit_cfg, model, tokenizer, data_module)
+            mvit_args.distributed = False
+            mvit_args.local_rank, mvit_args.rank, mvit_args.world_size = world_info_from_env()
+            device = init_distributed_device(mvit_args)
+            model.to(device=device)
+            model.model.vision_tower[0].to(device=device)
+            if mvit_args.distributed:
+                ddp_args = {}
+                model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], **ddp_args)
+        test(mvit_cfg, model, tokenizer, data_module, mvit_args)
 
 
 
